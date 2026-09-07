@@ -53,7 +53,9 @@ COPY --from=build /app/tsconfig.json ./tsconfig.json
 COPY --from=build /app/package.json ./package.json
 
 EXPOSE 3000
-# Default to the web process — the worker service overrides this with
-# `command: ["npm", "run", "worker"]` in whatever compose/stack file deploys
-# it (see openreply-vps.stack.yml in EvolutionAPI/omni-nexus for an example).
-CMD ["npm", "run", "start"]
+# Default to the web process. Which npm script runs is selected by the PROCESS
+# env var, so a single image serves both roles without the host having to
+# override the command: hosts like Railway ignore railway.json's startCommand
+# on CLI-uploaded deploys and expose no CLI setting for it, but they do let you
+# set env vars. Set PROCESS=worker on the worker service.
+CMD ["sh", "-c", "npm run ${PROCESS:-start}"]
