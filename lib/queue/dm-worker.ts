@@ -1244,6 +1244,35 @@ async function recordWorkerFailure(
   }
 }
 
+
+// A worker error that does not clear itself (Redis quota exhausted, network
+// down) re-fires continuously. Writing a row per emission once filled a 0.5 GB
+// database with 1.3M identical rows in 36 hours and took the whole instance
+// down. Record the first occurrence of a distinct message, then at most one
+// row per ERROR_LOG_WINDOW_MS, carrying how many were suppressed in between.
+const ERROR_LOG_WINDOW_MS = 5 * 60_000;
+const lastErrorLoggedAt = new Map<string, number>();
+const suppressedErrorCounts = new Map<string, number>();
+
+function shouldRecordWorkerError(message: string): boolean {
+  const last = lastErrorLoggedAt.get(message);
+  const now = Date.now();
+
+  if (last !== undefined && now - last < ERROR_LOG_WINDOW_MS) {
+    suppressedErrorCounts.set(message, (suppressedErrorCounts.get(message) ?? 0) + 1);
+    return false;
+  }
+
+  lastErrorLoggedAt.set(message, now);
+  return true;
+}
+
+function takeSuppressedCount(message: string): number {
+  const count = suppressedErrorCounts.get(message) ?? 0;
+  suppressedErrorCounts.delete(message);
+  return count;
+}
+
 export function createDMWorker(): Worker<DmQueueJob> {
   const worker = new Worker<DmQueueJob>(
     "dm-processing",
@@ -1251,6 +1280,13 @@ export function createDMWorker(): Worker<DmQueueJob> {
     {
       connection: getRedisConnection(),
       concurrency: 5,
+      // BullMQ's defaults (5s drain, 30s stalled check) issue ~30 Redis
+      // commands a minute while completely idle, which is 1.3M a month. These
+      // values cut that by roughly 6x. drainDelay only sets how long an empty
+      // queue blocks for; a newly added job still wakes the worker instantly,
+      // so nothing gets slower.
+      drainDelay: 30,
+      stalledInterval: 300_000,
       settings: {
         backoffStrategy: (attemptsMade: number) =>
           BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
@@ -1272,13 +1308,16 @@ export function createDMWorker(): Worker<DmQueueJob> {
 
   worker.on("error", (err) => {
     console.error("[DM Worker] Worker error:", err.message);
+    if (!shouldRecordWorkerError(err.message)) return;
+
+    const suppressed = takeSuppressedCount(err.message);
     void prisma.operationalEvent
       .create({
         data: {
           source: "WORKER",
           level: "ERROR",
           message: `DM worker process error: ${err.message}`,
-          payload: { name: err.name },
+          payload: { name: err.name, suppressedSinceLast: suppressed },
         },
       })
       .catch((recordError) => {
